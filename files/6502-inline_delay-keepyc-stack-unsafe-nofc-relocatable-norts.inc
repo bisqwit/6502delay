@@ -1,0 +1,1 @@
+6502-inline_delay-keepyc-stack-nofc-norts.inc

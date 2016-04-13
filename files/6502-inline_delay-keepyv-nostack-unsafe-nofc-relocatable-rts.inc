@@ -1,0 +1,1 @@
+6502-inline_delay-keepyv-nostack-unsafe-nofc-relocatable.inc

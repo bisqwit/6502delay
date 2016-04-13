@@ -1,0 +1,6699 @@
+; delay_n, delays n cycles with small code
+.setcpu "6502X"
+; Warning: Unofficial instructions are used!
+;
+; Will clobber Y, S, Z+N, C, and V
+; Will preserve A, X, D, and I (interrupt-disable flag)
+;
+; WARNING: THIS VERSION CLOBBERS THE STACK POINTER.
+;
+; WARNING: May write garbage into $00-$FF.
+;
+; Requires that a label @nearby_rts is defined,
+; that points _somewhere_ that contains a $60 byte (RTS).
+;
+; Requires that a label @nearby_rts_14cyc is defined,
+; that points _somewhere_ that contains a dummy 2-cycle
+; opcode, such as NOP or LDA #1, followed by a $60 byte (RTS).
+;
+; Requires that a label @nearby_rts_15cyc is defined,
+; that points _somewhere_ that contains a JMP to a location that does RTS.
+
+; Requires a disposable zeropage variable @zptemp.
+;
+; Requires a function called "delay_256x_a_30_clocks"
+; that is defined as follows:
+;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Delays X*256 clocks + overhead
+;; Clobbers A,X. Preserves Y.
+;; Depends on delay_a_25_clocks within short branch distance
+;; Time: X*256+16 clocks (including JSR)
+;;;;;;;;;;;;;;;;;;;;;;;;;
+;delay_256x_a_30_clocks:
+;	cpx #0
+;	beq delay_a_25_clocks
+;	;4 cycles done. Loop is 256 cycles
+;:       pha
+;	 lda #(256-7-2-2-3)
+;	 jsr delay_a_25_clocks
+;	pla
+;	dex
+;	beq delay_a_25_clocks ; count as 2
+;	bne :-
+;	;Loop end is -1+1 = 0 cycles. Total: 4+JSR+RTS = 16
+;
+; Requires a function called "delay_a_25_clocks"
+; that is defined as follows:
+;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Delays A clocks + overhead
+;; Clobbers A. Preserves X,Y.
+;; Time: A+25 clocks (including JSR)
+;;;;;;;;;;;;;;;;;;;;;;;;;
+;                  ;       Cycles              Accumulator         Carry flag
+;                  ; 0  1  2  3  4  5  6          (hex)           0 1 2 3 4 5 6
+;                  ;
+;                  ; 6  6  6  6  6  6  6   00 01 02 03 04 05 06
+;:      sbc #7     ; carry set by CMP
+;delay_a_25_clocks:
+;       cmp #7     ; 2  2  2  2  2  2  2   00 01 02 03 04 05 06   0 0 0 0 0 0 0
+;       bcs :-     ; 2  2  2  2  2  2  2   00 01 02 03 04 05 06   0 0 0 0 0 0 0
+;       lsr        ; 2  2  2  2  2  2  2   00 00 01 01 02 02 03   0 1 0 1 0 1 0
+;       bcs *+2    ; 2  3  2  3  2  3  2   00 00 01 01 02 02 03   0 1 0 1 0 1 0
+;       beq :+     ; 3  3  2  2  2  2  2   00 00 01 01 02 02 03   0 1 0 1 0 1 0
+;       lsr        ;       2  2  2  2  2         00 00 01 01 01       1 1 0 0 1
+;       beq @rts   ;       3  3  2  2  2         00 00 01 01 01       1 1 0 0 1
+;       bcc @rts   ;             3  3  2               01 01 01           0 0 1
+;:      bne @rts   ; 2  2              3   00 00             01   0 1         0
+;@rts:  rts        ; 6  6  6  6  6  6  6   00 00 00 00 01 01 01   0 1 1 1 0 0 1
+;; Total cycles:    25 26 27 28 29 30 31
+;
+; Generated code is:
+; - 1 bytes or less when n <= 3
+; - 2 bytes or less when n <= 7
+; - 3 bytes or less when n <= 10
+; - 4 bytes or less when n <= 18
+; - 5 bytes or less when n <= 22
+; - 6 bytes or less when n <= 30
+; - 7 bytes or less when n <= 289
+; - 8 bytes or less when n <= 292
+; - 9 bytes or less when n <= 296
+; -10 bytes or less when n <= 304
+; -11 bytes or less when n <= 307
+; -12 bytes or less when n <= 489
+; -13 bytes or less when n <= 20000
+; Detailed summary:
+; - When 2 <= n <= 10: min=1, avg=2.1, max=3
+; - When 11 <= n <= 20: min=3, avg=3.9, max=5
+; - When 21 <= n <= 30: min=5, avg=5.8, max=6
+; - When 31 <= n <= 50: min=7, avg=7.0, max=7
+; - When 51 <= n <= 75: min=7, avg=7.0, max=7
+; - When 76 <= n <= 100: min=7, avg=7.0, max=7
+; - When 101 <= n <= 200: min=7, avg=7.0, max=7
+; - When 201 <= n <= 300: min=7, avg=7.2, max=10
+; - When 301 <= n <= 500: min=10, avg=12.0, max=13
+; - When 501 <= n <= 750: min=11, avg=12.9, max=13
+; - When 751 <= n <= 1000: min=11, avg=12.9, max=13
+; - When 1001 <= n <= 2000: min=11, avg=12.9, max=13
+; - When 2001 <= n <= 3000: min=11, avg=12.9, max=13
+; - When 3001 <= n <= 5000: min=11, avg=12.9, max=13
+; - When 5001 <= n <= 7500: min=11, avg=12.9, max=13
+; - When 7501 <= n <= 10000: min=11, avg=12.9, max=13
+; - When 10001 <= n <= 20000: min=11, avg=12.9, max=13
+; Written by Joel Yliluoma
+
+
+.macro delay_n n, rest
+.assert (n = 0 || n >= 2), error, "delay_n: delay must be 0 or >= 2"
+.if(n = 0)
+.elseif(n < 0)
+	.error .sprintf("delay_n: n cannot be < 0, you gave %d", n)
+.elseif(n > 20000)
+	delay_n (n/2), { delay_n (n-(n/2)) }
+.else
+.if((n >= 1) && (n < 10001))
+.if((n >= 1) && (n < 5001))
+.if((n >= 1) && (n < 2501))
+.if((n >= 1) && (n < 1251))
+.if((n >= 1) && (n < 626))
+.if((n >= 1) && (n < 313))
+; 1 to 312
+.if(n = 1)
+	.error "delay_n: 1-cycle delay cannot be implemented"
+.elseif(n = 2)
+	; 1 bytes
+	nop
+.elseif(n = 3)
+	; 1 bytes
+	pha
+.elseif(n = 4 || n = 8 || n = 16 || n = 17 || n = 290 || n = 291 || n = 297 || n = 298 || n = 305 || n = 306)
+	; 2..11 bytes
+	delay_n (n-2)
+	nop
+.elseif(n = 5)
+	; 2 bytes
+	inc @zptemp
+.elseif(n = 6)
+	; 2 bytes
+	inc $F6,X
+.elseif(n = 7)
+	; 2 bytes
+	php
+	plp
+.elseif((n > 8 && n < 12) || n = 19 || (n > 20 && n < 24) || n = 25)
+	; 3..6 bytes
+	delay_n (n-7)
+	delay_n 7
+.elseif(n = 12)
+	; 3 bytes
+	jsr @nearby_rts
+.elseif(n = 13)
+	; 4 bytes
+	php
+	inc $F6,X
+	plp
+.elseif(n = 14)
+	; 3 bytes
+	jsr @nearby_rts_14cyc
+.elseif(n = 15)
+	; 3 bytes
+	jsr @nearby_rts_15cyc
+.elseif(n = 18 || n = 20 || n = 27 || n = 29 || n = 30 || n = 303 || n = 304)
+	; 4..10 bytes
+	delay_n (n-15)
+	jsr @nearby_rts_15cyc
+.elseif(n = 24 || (n > 298 && n < 302))
+	; 6..10 bytes
+	delay_n (n-12)
+	jsr @nearby_rts
+.elseif(n = 26 || n = 28 || n = 302)
+	; 6..10 bytes
+	delay_n (n-14)
+	jsr @nearby_rts_14cyc
+.elseif((n > 30 && n < 34))
+	; 7 bytes
+	tay
+	lda #n-31
+	jsr delay_a_25_clocks
+	tya
+.elseif((n > 33 && n < 290))
+	; 7 bytes
+	pha
+	lda #n-34
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 292)
+	; 8 bytes
+	pha
+	delay_n (n-3)
+.elseif((n > 292 && n < 297))
+	; 9 bytes
+	php
+	delay_n (n-7)
+	plp
+.elseif(n = 307)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #1
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif((n > 307 && n < 313))
+	; 12 bytes
+	pha
+	lda #>(n-61)
+	jsr delay_a_25_clocks
+	lda #<(n-61)
+	jsr delay_a_25_clocks
+	pla
+.endif
+.else
+.if((n >= 313) && (n < 469))
+.if((n >= 313) && (n < 391))
+.if((n >= 313) && (n < 352))
+.if((n >= 313) && (n < 332))
+; 313 to 331
+.if((n > 312 && n < 317))
+	; 12 bytes
+	pha
+	lda #>(n-61)
+	jsr delay_a_25_clocks
+	lda #<(n-61)
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 317)
+	; 12 bytes
+	pha
+	lda #1
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 318)
+	; 12 bytes
+	pha
+	lda #2
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 319)
+	; 12 bytes
+	pha
+	lda #3
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 320)
+	; 12 bytes
+	pha
+	lda #4
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 321)
+	; 12 bytes
+	pha
+	lda #5
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 322)
+	; 12 bytes
+	pha
+	lda #6
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 323)
+	; 12 bytes
+	pha
+	lda #7
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 324)
+	; 12 bytes
+	pha
+	lda #8
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 325)
+	; 12 bytes
+	pha
+	lda #9
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 326)
+	; 12 bytes
+	pha
+	lda #10
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 327)
+	; 12 bytes
+	pha
+	lda #11
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 328)
+	; 12 bytes
+	pha
+	lda #12
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 329)
+	; 12 bytes
+	pha
+	lda #13
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 330)
+	; 12 bytes
+	pha
+	lda #14
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 331)
+	; 12 bytes
+	pha
+	lda #15
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.endif
+.else
+; 332 to 351
+.if(n = 332)
+	; 12 bytes
+	pha
+	lda #16
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 333)
+	; 12 bytes
+	pha
+	lda #17
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 334)
+	; 12 bytes
+	pha
+	lda #18
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 335)
+	; 12 bytes
+	pha
+	lda #19
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 336)
+	; 12 bytes
+	pha
+	lda #20
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 337)
+	; 12 bytes
+	pha
+	lda #21
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 338)
+	; 12 bytes
+	pha
+	lda #22
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 339)
+	; 12 bytes
+	pha
+	lda #23
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 340)
+	; 12 bytes
+	pha
+	lda #24
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 341)
+	; 12 bytes
+	pha
+	lda #25
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 342)
+	; 12 bytes
+	pha
+	lda #26
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 343)
+	; 12 bytes
+	pha
+	lda #27
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 344)
+	; 12 bytes
+	pha
+	lda #28
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 345)
+	; 12 bytes
+	pha
+	lda #29
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 346)
+	; 12 bytes
+	pha
+	lda #30
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 347)
+	; 12 bytes
+	pha
+	lda #31
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 348)
+	; 12 bytes
+	pha
+	lda #32
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 349)
+	; 12 bytes
+	pha
+	lda #33
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 350)
+	; 12 bytes
+	pha
+	lda #34
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 351)
+	; 12 bytes
+	pha
+	lda #35
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.endif
+.endif
+.else
+.if((n >= 352) && (n < 371))
+; 352 to 370
+.if(n = 352)
+	; 12 bytes
+	pha
+	lda #36
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 353)
+	; 12 bytes
+	pha
+	lda #37
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 354)
+	; 12 bytes
+	pha
+	lda #38
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 355)
+	; 12 bytes
+	pha
+	lda #39
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 356)
+	; 12 bytes
+	pha
+	lda #40
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 357)
+	; 12 bytes
+	pha
+	lda #41
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 358)
+	; 12 bytes
+	pha
+	lda #42
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 359)
+	; 12 bytes
+	pha
+	lda #43
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 360)
+	; 12 bytes
+	pha
+	lda #44
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 361)
+	; 12 bytes
+	pha
+	lda #45
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 362)
+	; 12 bytes
+	pha
+	lda #46
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 363)
+	; 12 bytes
+	pha
+	lda #47
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 364)
+	; 12 bytes
+	pha
+	lda #48
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 365)
+	; 12 bytes
+	pha
+	lda #49
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 366)
+	; 12 bytes
+	pha
+	lda #50
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 367)
+	; 12 bytes
+	pha
+	lda #51
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 368)
+	; 12 bytes
+	pha
+	lda #52
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 369)
+	; 12 bytes
+	pha
+	lda #53
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 370)
+	; 12 bytes
+	pha
+	lda #54
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.endif
+.else
+; 371 to 390
+.if(n = 371)
+	; 12 bytes
+	pha
+	lda #55
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 372)
+	; 12 bytes
+	pha
+	lda #56
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 373)
+	; 12 bytes
+	pha
+	lda #57
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 374)
+	; 12 bytes
+	pha
+	lda #58
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 375)
+	; 12 bytes
+	pha
+	lda #59
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 376)
+	; 12 bytes
+	pha
+	lda #60
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 377)
+	; 12 bytes
+	pha
+	lda #61
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 378)
+	; 12 bytes
+	pha
+	lda #62
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 379)
+	; 12 bytes
+	pha
+	lda #63
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 380)
+	; 12 bytes
+	pha
+	lda #64
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 381)
+	; 12 bytes
+	pha
+	lda #65
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 382)
+	; 12 bytes
+	pha
+	lda #66
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 383)
+	; 12 bytes
+	pha
+	lda #67
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 384)
+	; 12 bytes
+	pha
+	lda #68
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 385)
+	; 12 bytes
+	pha
+	lda #69
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 386)
+	; 12 bytes
+	pha
+	lda #70
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 387)
+	; 12 bytes
+	pha
+	lda #71
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 388)
+	; 12 bytes
+	pha
+	lda #72
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 389)
+	; 12 bytes
+	pha
+	lda #73
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 390)
+	; 12 bytes
+	pha
+	lda #74
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.endif
+.endif
+.endif
+.else
+.if((n >= 391) && (n < 430))
+.if((n >= 391) && (n < 410))
+; 391 to 409
+.if(n = 391)
+	; 12 bytes
+	pha
+	lda #75
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 392)
+	; 12 bytes
+	pha
+	lda #76
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 393)
+	; 12 bytes
+	pha
+	lda #77
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 394)
+	; 12 bytes
+	pha
+	lda #78
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 395)
+	; 12 bytes
+	pha
+	lda #79
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 396)
+	; 12 bytes
+	pha
+	lda #80
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 397)
+	; 12 bytes
+	pha
+	lda #81
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 398)
+	; 12 bytes
+	pha
+	lda #82
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 399)
+	; 12 bytes
+	pha
+	lda #83
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 400)
+	; 12 bytes
+	pha
+	lda #84
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 401)
+	; 12 bytes
+	pha
+	lda #85
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 402)
+	; 12 bytes
+	pha
+	lda #86
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 403)
+	; 12 bytes
+	pha
+	lda #87
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 404)
+	; 12 bytes
+	pha
+	lda #88
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 405)
+	; 12 bytes
+	pha
+	lda #89
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 406)
+	; 12 bytes
+	pha
+	lda #90
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 407)
+	; 12 bytes
+	pha
+	lda #91
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 408)
+	; 12 bytes
+	pha
+	lda #92
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 409)
+	; 12 bytes
+	pha
+	lda #93
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.endif
+.else
+; 410 to 429
+.if(n = 410)
+	; 12 bytes
+	pha
+	lda #94
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 411)
+	; 12 bytes
+	pha
+	lda #95
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 412)
+	; 12 bytes
+	pha
+	lda #96
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 413)
+	; 12 bytes
+	pha
+	lda #97
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 414)
+	; 12 bytes
+	pha
+	lda #98
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 415)
+	; 12 bytes
+	pha
+	lda #99
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 416)
+	; 12 bytes
+	pha
+	lda #100
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 417)
+	; 12 bytes
+	pha
+	lda #101
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 418)
+	; 12 bytes
+	pha
+	lda #102
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 419)
+	; 12 bytes
+	pha
+	lda #103
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 420)
+	; 12 bytes
+	pha
+	lda #104
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 421)
+	; 12 bytes
+	pha
+	lda #105
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 422)
+	; 12 bytes
+	pha
+	lda #106
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 423)
+	; 12 bytes
+	pha
+	lda #107
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 424)
+	; 12 bytes
+	pha
+	lda #108
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 425)
+	; 12 bytes
+	pha
+	lda #109
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 426)
+	; 12 bytes
+	pha
+	lda #110
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 427)
+	; 12 bytes
+	pha
+	lda #111
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 428)
+	; 12 bytes
+	pha
+	lda #112
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 429)
+	; 12 bytes
+	pha
+	lda #113
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.endif
+.endif
+.else
+.if((n >= 430) && (n < 449))
+; 430 to 448
+.if(n = 430)
+	; 12 bytes
+	pha
+	lda #114
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 431)
+	; 12 bytes
+	pha
+	lda #115
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 432)
+	; 12 bytes
+	pha
+	lda #116
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 433)
+	; 12 bytes
+	pha
+	lda #117
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 434)
+	; 12 bytes
+	pha
+	lda #118
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 435)
+	; 12 bytes
+	pha
+	lda #119
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 436)
+	; 12 bytes
+	pha
+	lda #120
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 437)
+	; 12 bytes
+	pha
+	lda #121
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 438)
+	; 12 bytes
+	pha
+	lda #122
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 439)
+	; 12 bytes
+	pha
+	lda #123
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 440)
+	; 12 bytes
+	pha
+	lda #124
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 441)
+	; 12 bytes
+	pha
+	lda #125
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 442)
+	; 12 bytes
+	pha
+	lda #126
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 443)
+	; 12 bytes
+	pha
+	lda #127
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 444)
+	; 12 bytes
+	pha
+	lda #128
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 445)
+	; 12 bytes
+	pha
+	lda #129
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 446)
+	; 12 bytes
+	pha
+	lda #130
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 447)
+	; 12 bytes
+	pha
+	lda #131
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 448)
+	; 12 bytes
+	pha
+	lda #132
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.endif
+.else
+; 449 to 468
+.if(n = 449)
+	; 12 bytes
+	pha
+	lda #133
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 450)
+	; 12 bytes
+	pha
+	lda #134
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 451)
+	; 12 bytes
+	pha
+	lda #135
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 452)
+	; 12 bytes
+	pha
+	lda #136
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 453)
+	; 12 bytes
+	pha
+	lda #137
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 454)
+	; 12 bytes
+	pha
+	lda #138
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 455)
+	; 12 bytes
+	pha
+	lda #139
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 456)
+	; 12 bytes
+	pha
+	lda #140
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 457)
+	; 12 bytes
+	pha
+	lda #141
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 458)
+	; 12 bytes
+	pha
+	lda #142
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 459)
+	; 12 bytes
+	pha
+	lda #143
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 460)
+	; 12 bytes
+	pha
+	lda #144
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 461)
+	; 12 bytes
+	pha
+	lda #145
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 462)
+	; 12 bytes
+	pha
+	lda #146
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 463)
+	; 12 bytes
+	pha
+	lda #147
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 464)
+	; 12 bytes
+	pha
+	lda #148
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 465)
+	; 12 bytes
+	pha
+	lda #149
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 466)
+	; 12 bytes
+	pha
+	lda #150
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 467)
+	; 12 bytes
+	pha
+	lda #151
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 468)
+	; 12 bytes
+	pha
+	lda #152
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.endif
+.endif
+.endif
+.endif
+.else
+.if((n >= 469) && (n < 547))
+; 469 to 546
+.if(n = 469)
+	; 12 bytes
+	pha
+	lda #153
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 470)
+	; 12 bytes
+	pha
+	lda #154
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 471)
+	; 12 bytes
+	pha
+	lda #155
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 472)
+	; 12 bytes
+	pha
+	lda #156
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 473)
+	; 12 bytes
+	pha
+	lda #157
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 474)
+	; 12 bytes
+	pha
+	lda #158
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 475)
+	; 12 bytes
+	pha
+	lda #159
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 476)
+	; 12 bytes
+	pha
+	lda #160
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 477)
+	; 12 bytes
+	pha
+	lda #161
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 478)
+	; 12 bytes
+	pha
+	lda #162
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 479)
+	; 12 bytes
+	pha
+	lda #163
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 480)
+	; 12 bytes
+	pha
+	lda #164
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 481)
+	; 12 bytes
+	pha
+	lda #165
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 482)
+	; 12 bytes
+	pha
+	lda #166
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 483)
+	; 12 bytes
+	pha
+	lda #167
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 484)
+	; 12 bytes
+	pha
+	lda #168
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 485)
+	; 12 bytes
+	pha
+	lda #169
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 486)
+	; 12 bytes
+	pha
+	lda #170
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 487)
+	; 12 bytes
+	pha
+	lda #171
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 488)
+	; 12 bytes
+	pha
+	lda #172
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 489)
+	; 12 bytes
+	pha
+	lda #173
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 490)
+	; 13 bytes
+	pha
+	nop
+	lda #172
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif(n = 491)
+	; 13 bytes
+	pha
+	nop
+	lda #173
+	jsr delay_a_25_clocks
+	lda #255
+	jsr delay_a_25_clocks
+	pla
+.elseif((n > 491 && n < 547))
+	; 13 bytes
+	pha
+	txa
+	pha
+	ldx #>(n-52)
+	lda #<(n-52)
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.endif
+.else
+; 547 to 625
+.if((n > 546 && n < 556) || n = 557 || (n > 567 && n < 626))
+	; 13 bytes
+	pha
+	txa
+	pha
+	ldx #>(n-52)
+	lda #<(n-52)
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 556)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #2
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 558 || n = 563 || n = 566)
+	; 12 bytes
+	delay_n (n-2)
+	nop
+.elseif(n = 559)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #2
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 560)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #2
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 561)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #2
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 562 || n = 567)
+	; 12 bytes
+	pha
+	delay_n (n-3)
+.elseif(n = 564)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #2
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 565)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #2
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.endif
+.endif
+.endif
+.endif
+.else
+; 626 to 1250
+.if((n > 625 && n < 813) || n = 814 || (n > 824 && n < 1070) || n = 1071 || (n > 1081 && n < 1251))
+	; 13 bytes
+	pha
+	txa
+	pha
+	ldx #>(n-52)
+	lda #<(n-52)
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 813)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #3
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 815 || n = 820 || n = 823 || n = 1072 || n = 1077 || n = 1080)
+	; 12 bytes
+	delay_n (n-2)
+	nop
+.elseif(n = 816)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #3
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 817)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #3
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 818)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #3
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 819 || n = 824 || n = 1076 || n = 1081)
+	; 12 bytes
+	pha
+	delay_n (n-3)
+.elseif(n = 821)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #3
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 822)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #3
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 1070)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #4
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 1073)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #4
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 1074)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #4
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 1075)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #4
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 1078)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #4
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 1079)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #4
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.endif
+.endif
+.else
+.if((n >= 1251) && (n < 1876))
+; 1251 to 1875
+.if((n > 1250 && n < 1327) || n = 1328 || (n > 1338 && n < 1584) || n = 1585 || (n > 1595 && n < 1841) || n = 1842 || (n > 1852 && n < 1876))
+	; 13 bytes
+	pha
+	txa
+	pha
+	ldx #>(n-52)
+	lda #<(n-52)
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 1327)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #5
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 1329 || n = 1334 || n = 1337 || n = 1586 || n = 1591 || n = 1594 || n = 1843 || n = 1848 || n = 1851)
+	; 12 bytes
+	delay_n (n-2)
+	nop
+.elseif(n = 1330)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #5
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 1331)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #5
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 1332)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #5
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 1333 || n = 1338 || n = 1590 || n = 1595 || n = 1847 || n = 1852)
+	; 12 bytes
+	pha
+	delay_n (n-3)
+.elseif(n = 1335)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #5
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 1336)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #5
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 1584)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #6
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 1587)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #6
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 1588)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #6
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 1589)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #6
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 1592)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #6
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 1593)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #6
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 1841)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #7
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 1844)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #7
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 1845)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #7
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 1846)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #7
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 1849)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #7
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 1850)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #7
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.endif
+.else
+; 1876 to 2500
+.if((n > 1875 && n < 2098) || n = 2099 || (n > 2109 && n < 2355) || n = 2356 || (n > 2366 && n < 2501))
+	; 13 bytes
+	pha
+	txa
+	pha
+	ldx #>(n-52)
+	lda #<(n-52)
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 2098)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #8
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 2100 || n = 2105 || n = 2108 || n = 2357 || n = 2362 || n = 2365)
+	; 12 bytes
+	delay_n (n-2)
+	nop
+.elseif(n = 2101)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #8
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 2102)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #8
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 2103)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #8
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 2104 || n = 2109 || n = 2361 || n = 2366)
+	; 12 bytes
+	pha
+	delay_n (n-3)
+.elseif(n = 2106)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #8
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 2107)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #8
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 2355)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #9
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 2358)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #9
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 2359)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #9
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 2360)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #9
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 2363)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #9
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 2364)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #9
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.endif
+.endif
+.endif
+.else
+.if((n >= 2501) && (n < 3751))
+.if((n >= 2501) && (n < 3126))
+; 2501 to 3125
+.if((n > 2500 && n < 2612) || n = 2613 || (n > 2623 && n < 2869) || n = 2870 || (n > 2880 && n < 3126))
+	; 13 bytes
+	pha
+	txa
+	pha
+	ldx #>(n-52)
+	lda #<(n-52)
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 2612)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #10
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 2614 || n = 2619 || n = 2622 || n = 2871 || n = 2876 || n = 2879)
+	; 12 bytes
+	delay_n (n-2)
+	nop
+.elseif(n = 2615)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #10
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 2616)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #10
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 2617)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #10
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 2618 || n = 2623 || n = 2875 || n = 2880)
+	; 12 bytes
+	pha
+	delay_n (n-3)
+.elseif(n = 2620)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #10
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 2621)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #10
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 2869)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #11
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 2872)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #11
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 2873)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #11
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 2874)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #11
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 2877)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #11
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 2878)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #11
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.endif
+.else
+; 3126 to 3750
+.if(n = 3126)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #12
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 3127 || (n > 3137 && n < 3383) || n = 3384 || (n > 3394 && n < 3640) || n = 3641 || (n > 3651 && n < 3751))
+	; 13 bytes
+	pha
+	txa
+	pha
+	ldx #>(n-52)
+	lda #<(n-52)
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 3128 || n = 3133 || n = 3136 || n = 3385 || n = 3390 || n = 3393 || n = 3642 || n = 3647 || n = 3650)
+	; 12 bytes
+	delay_n (n-2)
+	nop
+.elseif(n = 3129)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #12
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 3130)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #12
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 3131)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #12
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 3132 || n = 3137 || n = 3389 || n = 3394 || n = 3646 || n = 3651)
+	; 12 bytes
+	pha
+	delay_n (n-3)
+.elseif(n = 3134)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #12
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 3135)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #12
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 3383)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #13
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 3386)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #13
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 3387)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #13
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 3388)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #13
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 3391)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #13
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 3392)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #13
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 3640)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #14
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 3643)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #14
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 3644)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #14
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 3645)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #14
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 3648)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #14
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 3649)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #14
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.endif
+.endif
+.else
+.if((n >= 3751) && (n < 4376))
+; 3751 to 4375
+.if((n > 3750 && n < 3897) || n = 3898 || (n > 3908 && n < 4154) || n = 4155 || (n > 4165 && n < 4376))
+	; 13 bytes
+	pha
+	txa
+	pha
+	ldx #>(n-52)
+	lda #<(n-52)
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 3897)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #15
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 3899 || n = 3904 || n = 3907 || n = 4156 || n = 4161 || n = 4164)
+	; 12 bytes
+	delay_n (n-2)
+	nop
+.elseif(n = 3900)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #15
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 3901)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #15
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 3902)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #15
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 3903 || n = 3908 || n = 4160 || n = 4165)
+	; 12 bytes
+	pha
+	delay_n (n-3)
+.elseif(n = 3905)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #15
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 3906)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #15
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 4154)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #16
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 4157)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #16
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 4158)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #16
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 4159)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #16
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 4162)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #16
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 4163)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #16
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.endif
+.else
+; 4376 to 5000
+.if((n > 4375 && n < 4411) || n = 4412 || (n > 4422 && n < 4668) || n = 4669 || (n > 4679 && n < 4925) || n = 4926 || (n > 4936 && n < 5001))
+	; 13 bytes
+	pha
+	txa
+	pha
+	ldx #>(n-52)
+	lda #<(n-52)
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 4411)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #17
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 4413 || n = 4418 || n = 4421 || n = 4670 || n = 4675 || n = 4678 || n = 4927 || n = 4932 || n = 4935)
+	; 12 bytes
+	delay_n (n-2)
+	nop
+.elseif(n = 4414)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #17
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 4415)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #17
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 4416)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #17
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 4417 || n = 4422 || n = 4674 || n = 4679 || n = 4931 || n = 4936)
+	; 12 bytes
+	pha
+	delay_n (n-3)
+.elseif(n = 4419)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #17
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 4420)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #17
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 4668)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #18
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 4671)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #18
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 4672)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #18
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 4673)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #18
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 4676)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #18
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 4677)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #18
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 4925)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #19
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 4928)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #19
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 4929)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #19
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 4930)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #19
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 4933)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #19
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 4934)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #19
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.endif
+.endif
+.endif
+.endif
+.else
+.if((n >= 5001) && (n < 7501))
+.if((n >= 5001) && (n < 6251))
+.if((n >= 5001) && (n < 5626))
+; 5001 to 5625
+.if((n > 5000 && n < 5182) || n = 5183 || (n > 5193 && n < 5439) || n = 5440 || (n > 5450 && n < 5626))
+	; 13 bytes
+	pha
+	txa
+	pha
+	ldx #>(n-52)
+	lda #<(n-52)
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 5182)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #20
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 5184 || n = 5189 || n = 5192 || n = 5441 || n = 5446 || n = 5449)
+	; 12 bytes
+	delay_n (n-2)
+	nop
+.elseif(n = 5185)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #20
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 5186)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #20
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 5187)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #20
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 5188 || n = 5193 || n = 5445 || n = 5450)
+	; 12 bytes
+	pha
+	delay_n (n-3)
+.elseif(n = 5190)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #20
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 5191)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #20
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 5439)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #21
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 5442)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #21
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 5443)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #21
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 5444)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #21
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 5447)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #21
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 5448)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #21
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.endif
+.else
+; 5626 to 6250
+.if((n > 5625 && n < 5696) || n = 5697 || (n > 5707 && n < 5953) || n = 5954 || (n > 5964 && n < 6210) || n = 6211 || (n > 6221 && n < 6251))
+	; 13 bytes
+	pha
+	txa
+	pha
+	ldx #>(n-52)
+	lda #<(n-52)
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 5696)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #22
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 5698 || n = 5703 || n = 5706 || n = 5955 || n = 5960 || n = 5963 || n = 6212 || n = 6217 || n = 6220)
+	; 12 bytes
+	delay_n (n-2)
+	nop
+.elseif(n = 5699)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #22
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 5700)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #22
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 5701)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #22
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 5702 || n = 5707 || n = 5959 || n = 5964 || n = 6216 || n = 6221)
+	; 12 bytes
+	pha
+	delay_n (n-3)
+.elseif(n = 5704)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #22
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 5705)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #22
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 5953)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #23
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 5956)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #23
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 5957)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #23
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 5958)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #23
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 5961)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #23
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 5962)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #23
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 6210)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #24
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 6213)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #24
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 6214)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #24
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 6215)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #24
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 6218)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #24
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 6219)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #24
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.endif
+.endif
+.else
+.if((n >= 6251) && (n < 6876))
+; 6251 to 6875
+.if((n > 6250 && n < 6467) || n = 6468 || (n > 6478 && n < 6724) || n = 6725 || (n > 6735 && n < 6876))
+	; 13 bytes
+	pha
+	txa
+	pha
+	ldx #>(n-52)
+	lda #<(n-52)
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 6467)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #25
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 6469 || n = 6474 || n = 6477 || n = 6726 || n = 6731 || n = 6734)
+	; 12 bytes
+	delay_n (n-2)
+	nop
+.elseif(n = 6470)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #25
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 6471)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #25
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 6472)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #25
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 6473 || n = 6478 || n = 6730 || n = 6735)
+	; 12 bytes
+	pha
+	delay_n (n-3)
+.elseif(n = 6475)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #25
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 6476)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #25
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 6724)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #26
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 6727)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #26
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 6728)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #26
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 6729)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #26
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 6732)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #26
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 6733)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #26
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.endif
+.else
+; 6876 to 7500
+.if((n > 6875 && n < 6981) || n = 6982 || (n > 6992 && n < 7238) || n = 7239 || (n > 7249 && n < 7495) || n = 7496)
+	; 13 bytes
+	pha
+	txa
+	pha
+	ldx #>(n-52)
+	lda #<(n-52)
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 6981)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #27
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 6983 || n = 6988 || n = 6991 || n = 7240 || n = 7245 || n = 7248 || n = 7497)
+	; 12 bytes
+	delay_n (n-2)
+	nop
+.elseif(n = 6984)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #27
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 6985)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #27
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 6986)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #27
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 6987 || n = 6992 || n = 7244 || n = 7249)
+	; 12 bytes
+	pha
+	delay_n (n-3)
+.elseif(n = 6989)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #27
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 6990)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #27
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 7238)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #28
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 7241)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #28
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 7242)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #28
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 7243)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #28
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 7246)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #28
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 7247)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #28
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 7495)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #29
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 7498)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #29
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 7499)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #29
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 7500)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #29
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.endif
+.endif
+.endif
+.else
+.if((n >= 7501) && (n < 8751))
+.if((n >= 7501) && (n < 8126))
+; 7501 to 8125
+.if(n = 7501 || n = 7506 || n = 7758 || n = 7763 || n = 8015 || n = 8020)
+	; 12 bytes
+	pha
+	delay_n (n-3)
+.elseif(n = 7502 || n = 7505 || n = 7754 || n = 7759 || n = 7762 || n = 8011 || n = 8016 || n = 8019)
+	; 12 bytes
+	delay_n (n-2)
+	nop
+.elseif(n = 7503)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #29
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 7504)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #29
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif((n > 7506 && n < 7752) || n = 7753 || (n > 7763 && n < 8009) || n = 8010 || (n > 8020 && n < 8126))
+	; 13 bytes
+	pha
+	txa
+	pha
+	ldx #>(n-52)
+	lda #<(n-52)
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 7752)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #30
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 7755)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #30
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 7756)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #30
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 7757)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #30
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 7760)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #30
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 7761)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #30
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 8009)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #31
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 8012)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #31
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 8013)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #31
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 8014)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #31
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 8017)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #31
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 8018)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #31
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.endif
+.else
+; 8126 to 8750
+.if((n > 8125 && n < 8266) || n = 8267 || (n > 8277 && n < 8523) || n = 8524 || (n > 8534 && n < 8751))
+	; 13 bytes
+	pha
+	txa
+	pha
+	ldx #>(n-52)
+	lda #<(n-52)
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 8266)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #32
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 8268 || n = 8273 || n = 8276 || n = 8525 || n = 8530 || n = 8533)
+	; 12 bytes
+	delay_n (n-2)
+	nop
+.elseif(n = 8269)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #32
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 8270)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #32
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 8271)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #32
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 8272 || n = 8277 || n = 8529 || n = 8534)
+	; 12 bytes
+	pha
+	delay_n (n-3)
+.elseif(n = 8274)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #32
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 8275)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #32
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 8523)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #33
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 8526)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #33
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 8527)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #33
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 8528)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #33
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 8531)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #33
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 8532)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #33
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.endif
+.endif
+.else
+.if((n >= 8751) && (n < 9376))
+; 8751 to 9375
+.if((n > 8750 && n < 8780) || n = 8781 || (n > 8791 && n < 9037) || n = 9038 || (n > 9048 && n < 9294) || n = 9295 || (n > 9305 && n < 9376))
+	; 13 bytes
+	pha
+	txa
+	pha
+	ldx #>(n-52)
+	lda #<(n-52)
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 8780)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #34
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 8782 || n = 8787 || n = 8790 || n = 9039 || n = 9044 || n = 9047 || n = 9296 || n = 9301 || n = 9304)
+	; 12 bytes
+	delay_n (n-2)
+	nop
+.elseif(n = 8783)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #34
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 8784)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #34
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 8785)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #34
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 8786 || n = 8791 || n = 9043 || n = 9048 || n = 9300 || n = 9305)
+	; 12 bytes
+	pha
+	delay_n (n-3)
+.elseif(n = 8788)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #34
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 8789)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #34
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 9037)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #35
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 9040)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #35
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 9041)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #35
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 9042)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #35
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 9045)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #35
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 9046)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #35
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 9294)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #36
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 9297)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #36
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 9298)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #36
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 9299)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #36
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 9302)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #36
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 9303)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #36
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.endif
+.else
+; 9376 to 10000
+.if((n > 9375 && n < 9551) || n = 9552 || (n > 9562 && n < 9808) || n = 9809 || (n > 9819 && n < 10001))
+	; 13 bytes
+	pha
+	txa
+	pha
+	ldx #>(n-52)
+	lda #<(n-52)
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 9551)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #37
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 9553 || n = 9558 || n = 9561 || n = 9810 || n = 9815 || n = 9818)
+	; 12 bytes
+	delay_n (n-2)
+	nop
+.elseif(n = 9554)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #37
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 9555)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #37
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 9556)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #37
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 9557 || n = 9562 || n = 9814 || n = 9819)
+	; 12 bytes
+	pha
+	delay_n (n-3)
+.elseif(n = 9559)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #37
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 9560)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #37
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 9808)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #38
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 9811)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #38
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 9812)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #38
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 9813)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #38
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 9816)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #38
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 9817)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #38
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.endif
+.endif
+.endif
+.endif
+.endif
+.else
+.if((n >= 10001) && (n < 15001))
+.if((n >= 10001) && (n < 12501))
+.if((n >= 10001) && (n < 11251))
+.if((n >= 10001) && (n < 10626))
+; 10001 to 10625
+.if((n > 10000 && n < 10065) || n = 10066 || (n > 10076 && n < 10322) || n = 10323 || (n > 10333 && n < 10579) || n = 10580 || (n > 10590 && n < 10626))
+	; 13 bytes
+	pha
+	txa
+	pha
+	ldx #>(n-52)
+	lda #<(n-52)
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 10065)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #39
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 10067 || n = 10072 || n = 10075 || n = 10324 || n = 10329 || n = 10332 || n = 10581 || n = 10586 || n = 10589)
+	; 12 bytes
+	delay_n (n-2)
+	nop
+.elseif(n = 10068)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #39
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 10069)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #39
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 10070)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #39
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 10071 || n = 10076 || n = 10328 || n = 10333 || n = 10585 || n = 10590)
+	; 12 bytes
+	pha
+	delay_n (n-3)
+.elseif(n = 10073)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #39
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 10074)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #39
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 10322)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #40
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 10325)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #40
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 10326)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #40
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 10327)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #40
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 10330)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #40
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 10331)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #40
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 10579)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #41
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 10582)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #41
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 10583)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #41
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 10584)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #41
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 10587)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #41
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 10588)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #41
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.endif
+.else
+; 10626 to 11250
+.if((n > 10625 && n < 10836) || n = 10837 || (n > 10847 && n < 11093) || n = 11094 || (n > 11104 && n < 11251))
+	; 13 bytes
+	pha
+	txa
+	pha
+	ldx #>(n-52)
+	lda #<(n-52)
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 10836)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #42
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 10838 || n = 10843 || n = 10846 || n = 11095 || n = 11100 || n = 11103)
+	; 12 bytes
+	delay_n (n-2)
+	nop
+.elseif(n = 10839)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #42
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 10840)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #42
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 10841)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #42
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 10842 || n = 10847 || n = 11099 || n = 11104)
+	; 12 bytes
+	pha
+	delay_n (n-3)
+.elseif(n = 10844)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #42
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 10845)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #42
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 11093)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #43
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 11096)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #43
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 11097)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #43
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 11098)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #43
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 11101)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #43
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 11102)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #43
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.endif
+.endif
+.else
+.if((n >= 11251) && (n < 11876))
+; 11251 to 11875
+.if((n > 11250 && n < 11350) || n = 11351 || (n > 11361 && n < 11607) || n = 11608 || (n > 11618 && n < 11864) || n = 11865)
+	; 13 bytes
+	pha
+	txa
+	pha
+	ldx #>(n-52)
+	lda #<(n-52)
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 11350)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #44
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 11352 || n = 11357 || n = 11360 || n = 11609 || n = 11614 || n = 11617 || n = 11866 || n = 11871 || n = 11874)
+	; 12 bytes
+	delay_n (n-2)
+	nop
+.elseif(n = 11353)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #44
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 11354)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #44
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 11355)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #44
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 11356 || n = 11361 || n = 11613 || n = 11618 || n = 11870 || n = 11875)
+	; 12 bytes
+	pha
+	delay_n (n-3)
+.elseif(n = 11358)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #44
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 11359)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #44
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 11607)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #45
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 11610)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #45
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 11611)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #45
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 11612)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #45
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 11615)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #45
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 11616)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #45
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 11864)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #46
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 11867)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #46
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 11868)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #46
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 11869)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #46
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 11872)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #46
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 11873)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #46
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.endif
+.else
+; 11876 to 12500
+.if((n > 11875 && n < 12121) || n = 12122 || (n > 12132 && n < 12378) || n = 12379 || (n > 12389 && n < 12501))
+	; 13 bytes
+	pha
+	txa
+	pha
+	ldx #>(n-52)
+	lda #<(n-52)
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 12121)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #47
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 12123 || n = 12128 || n = 12131 || n = 12380 || n = 12385 || n = 12388)
+	; 12 bytes
+	delay_n (n-2)
+	nop
+.elseif(n = 12124)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #47
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 12125)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #47
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 12126)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #47
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 12127 || n = 12132 || n = 12384 || n = 12389)
+	; 12 bytes
+	pha
+	delay_n (n-3)
+.elseif(n = 12129)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #47
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 12130)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #47
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 12378)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #48
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 12381)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #48
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 12382)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #48
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 12383)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #48
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 12386)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #48
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 12387)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #48
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.endif
+.endif
+.endif
+.else
+.if((n >= 12501) && (n < 13751))
+.if((n >= 12501) && (n < 13126))
+; 12501 to 13125
+.if((n > 12500 && n < 12635) || n = 12636 || (n > 12646 && n < 12892) || n = 12893 || (n > 12903 && n < 13126))
+	; 13 bytes
+	pha
+	txa
+	pha
+	ldx #>(n-52)
+	lda #<(n-52)
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 12635)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #49
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 12637 || n = 12642 || n = 12645 || n = 12894 || n = 12899 || n = 12902)
+	; 12 bytes
+	delay_n (n-2)
+	nop
+.elseif(n = 12638)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #49
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 12639)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #49
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 12640)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #49
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 12641 || n = 12646 || n = 12898 || n = 12903)
+	; 12 bytes
+	pha
+	delay_n (n-3)
+.elseif(n = 12643)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #49
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 12644)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #49
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 12892)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #50
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 12895)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #50
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 12896)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #50
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 12897)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #50
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 12900)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #50
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 12901)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #50
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.endif
+.else
+; 13126 to 13750
+.if((n > 13125 && n < 13149) || n = 13150 || (n > 13160 && n < 13406) || n = 13407 || (n > 13417 && n < 13663) || n = 13664 || (n > 13674 && n < 13751))
+	; 13 bytes
+	pha
+	txa
+	pha
+	ldx #>(n-52)
+	lda #<(n-52)
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 13149)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #51
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 13151 || n = 13156 || n = 13159 || n = 13408 || n = 13413 || n = 13416 || n = 13665 || n = 13670 || n = 13673)
+	; 12 bytes
+	delay_n (n-2)
+	nop
+.elseif(n = 13152)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #51
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 13153)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #51
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 13154)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #51
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 13155 || n = 13160 || n = 13412 || n = 13417 || n = 13669 || n = 13674)
+	; 12 bytes
+	pha
+	delay_n (n-3)
+.elseif(n = 13157)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #51
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 13158)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #51
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 13406)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #52
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 13409)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #52
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 13410)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #52
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 13411)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #52
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 13414)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #52
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 13415)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #52
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 13663)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #53
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 13666)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #53
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 13667)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #53
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 13668)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #53
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 13671)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #53
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 13672)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #53
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.endif
+.endif
+.else
+.if((n >= 13751) && (n < 14376))
+; 13751 to 14375
+.if((n > 13750 && n < 13920) || n = 13921 || (n > 13931 && n < 14177) || n = 14178 || (n > 14188 && n < 14376))
+	; 13 bytes
+	pha
+	txa
+	pha
+	ldx #>(n-52)
+	lda #<(n-52)
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 13920)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #54
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 13922 || n = 13927 || n = 13930 || n = 14179 || n = 14184 || n = 14187)
+	; 12 bytes
+	delay_n (n-2)
+	nop
+.elseif(n = 13923)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #54
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 13924)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #54
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 13925)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #54
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 13926 || n = 13931 || n = 14183 || n = 14188)
+	; 12 bytes
+	pha
+	delay_n (n-3)
+.elseif(n = 13928)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #54
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 13929)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #54
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 14177)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #55
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 14180)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #55
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 14181)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #55
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 14182)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #55
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 14185)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #55
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 14186)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #55
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.endif
+.else
+; 14376 to 15000
+.if((n > 14375 && n < 14434) || n = 14435 || (n > 14445 && n < 14691) || n = 14692 || (n > 14702 && n < 14948) || n = 14949 || (n > 14959 && n < 15001))
+	; 13 bytes
+	pha
+	txa
+	pha
+	ldx #>(n-52)
+	lda #<(n-52)
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 14434)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #56
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 14436 || n = 14441 || n = 14444 || n = 14693 || n = 14698 || n = 14701 || n = 14950 || n = 14955 || n = 14958)
+	; 12 bytes
+	delay_n (n-2)
+	nop
+.elseif(n = 14437)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #56
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 14438)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #56
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 14439)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #56
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 14440 || n = 14445 || n = 14697 || n = 14702 || n = 14954 || n = 14959)
+	; 12 bytes
+	pha
+	delay_n (n-3)
+.elseif(n = 14442)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #56
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 14443)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #56
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 14691)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #57
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 14694)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #57
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 14695)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #57
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 14696)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #57
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 14699)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #57
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 14700)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #57
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 14948)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #58
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 14951)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #58
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 14952)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #58
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 14953)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #58
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 14956)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #58
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 14957)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #58
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.endif
+.endif
+.endif
+.endif
+.else
+.if((n >= 15001) && (n < 17501))
+.if((n >= 15001) && (n < 16251))
+.if((n >= 15001) && (n < 15626))
+; 15001 to 15625
+.if((n > 15000 && n < 15205) || n = 15206 || (n > 15216 && n < 15462) || n = 15463 || (n > 15473 && n < 15626))
+	; 13 bytes
+	pha
+	txa
+	pha
+	ldx #>(n-52)
+	lda #<(n-52)
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 15205)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #59
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 15207 || n = 15212 || n = 15215 || n = 15464 || n = 15469 || n = 15472)
+	; 12 bytes
+	delay_n (n-2)
+	nop
+.elseif(n = 15208)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #59
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 15209)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #59
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 15210)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #59
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 15211 || n = 15216 || n = 15468 || n = 15473)
+	; 12 bytes
+	pha
+	delay_n (n-3)
+.elseif(n = 15213)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #59
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 15214)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #59
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 15462)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #60
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 15465)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #60
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 15466)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #60
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 15467)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #60
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 15470)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #60
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 15471)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #60
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.endif
+.else
+; 15626 to 16250
+.if((n > 15625 && n < 15719) || n = 15720 || (n > 15730 && n < 15976) || n = 15977 || (n > 15987 && n < 16233) || n = 16234 || (n > 16244 && n < 16251))
+	; 13 bytes
+	pha
+	txa
+	pha
+	ldx #>(n-52)
+	lda #<(n-52)
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 15719)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #61
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 15721 || n = 15726 || n = 15729 || n = 15978 || n = 15983 || n = 15986 || n = 16235 || n = 16240 || n = 16243)
+	; 12 bytes
+	delay_n (n-2)
+	nop
+.elseif(n = 15722)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #61
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 15723)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #61
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 15724)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #61
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 15725 || n = 15730 || n = 15982 || n = 15987 || n = 16239 || n = 16244)
+	; 12 bytes
+	pha
+	delay_n (n-3)
+.elseif(n = 15727)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #61
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 15728)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #61
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 15976)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #62
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 15979)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #62
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 15980)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #62
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 15981)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #62
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 15984)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #62
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 15985)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #62
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 16233)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #63
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 16236)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #63
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 16237)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #63
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 16238)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #63
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 16241)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #63
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 16242)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #63
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.endif
+.endif
+.else
+.if((n >= 16251) && (n < 16876))
+; 16251 to 16875
+.if((n > 16250 && n < 16490) || n = 16491 || (n > 16501 && n < 16747) || n = 16748 || (n > 16758 && n < 16876))
+	; 13 bytes
+	pha
+	txa
+	pha
+	ldx #>(n-52)
+	lda #<(n-52)
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 16490)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #64
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 16492 || n = 16497 || n = 16500 || n = 16749 || n = 16754 || n = 16757)
+	; 12 bytes
+	delay_n (n-2)
+	nop
+.elseif(n = 16493)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #64
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 16494)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #64
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 16495)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #64
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 16496 || n = 16501 || n = 16753 || n = 16758)
+	; 12 bytes
+	pha
+	delay_n (n-3)
+.elseif(n = 16498)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #64
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 16499)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #64
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 16747)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #65
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 16750)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #65
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 16751)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #65
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 16752)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #65
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 16755)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #65
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 16756)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #65
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.endif
+.else
+; 16876 to 17500
+.if((n > 16875 && n < 17004) || n = 17005 || (n > 17015 && n < 17261) || n = 17262 || (n > 17272 && n < 17501))
+	; 13 bytes
+	pha
+	txa
+	pha
+	ldx #>(n-52)
+	lda #<(n-52)
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 17004)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #66
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 17006 || n = 17011 || n = 17014 || n = 17263 || n = 17268 || n = 17271)
+	; 12 bytes
+	delay_n (n-2)
+	nop
+.elseif(n = 17007)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #66
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 17008)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #66
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 17009)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #66
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 17010 || n = 17015 || n = 17267 || n = 17272)
+	; 12 bytes
+	pha
+	delay_n (n-3)
+.elseif(n = 17012)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #66
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 17013)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #66
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 17261)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #67
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 17264)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #67
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 17265)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #67
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 17266)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #67
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 17269)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #67
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 17270)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #67
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.endif
+.endif
+.endif
+.else
+.if((n >= 17501) && (n < 18751))
+.if((n >= 17501) && (n < 18126))
+; 17501 to 18125
+.if((n > 17500 && n < 17518) || n = 17519 || (n > 17529 && n < 17775) || n = 17776 || (n > 17786 && n < 18032) || n = 18033 || (n > 18043 && n < 18126))
+	; 13 bytes
+	pha
+	txa
+	pha
+	ldx #>(n-52)
+	lda #<(n-52)
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 17518)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #68
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 17520 || n = 17525 || n = 17528 || n = 17777 || n = 17782 || n = 17785 || n = 18034 || n = 18039 || n = 18042)
+	; 12 bytes
+	delay_n (n-2)
+	nop
+.elseif(n = 17521)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #68
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 17522)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #68
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 17523)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #68
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 17524 || n = 17529 || n = 17781 || n = 17786 || n = 18038 || n = 18043)
+	; 12 bytes
+	pha
+	delay_n (n-3)
+.elseif(n = 17526)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #68
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 17527)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #68
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 17775)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #69
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 17778)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #69
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 17779)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #69
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 17780)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #69
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 17783)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #69
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 17784)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #69
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 18032)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #70
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 18035)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #70
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 18036)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #70
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 18037)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #70
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 18040)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #70
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 18041)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #70
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.endif
+.else
+; 18126 to 18750
+.if((n > 18125 && n < 18289) || n = 18290 || (n > 18300 && n < 18546) || n = 18547 || (n > 18557 && n < 18751))
+	; 13 bytes
+	pha
+	txa
+	pha
+	ldx #>(n-52)
+	lda #<(n-52)
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 18289)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #71
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 18291 || n = 18296 || n = 18299 || n = 18548 || n = 18553 || n = 18556)
+	; 12 bytes
+	delay_n (n-2)
+	nop
+.elseif(n = 18292)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #71
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 18293)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #71
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 18294)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #71
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 18295 || n = 18300 || n = 18552 || n = 18557)
+	; 12 bytes
+	pha
+	delay_n (n-3)
+.elseif(n = 18297)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #71
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 18298)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #71
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 18546)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #72
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 18549)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #72
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 18550)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #72
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 18551)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #72
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 18554)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #72
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 18555)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #72
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.endif
+.endif
+.else
+.if((n >= 18751) && (n < 19376))
+; 18751 to 19375
+.if((n > 18750 && n < 18803) || n = 18804 || (n > 18814 && n < 19060) || n = 19061 || (n > 19071 && n < 19317) || n = 19318 || (n > 19328 && n < 19376))
+	; 13 bytes
+	pha
+	txa
+	pha
+	ldx #>(n-52)
+	lda #<(n-52)
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 18803)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #73
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 18805 || n = 18810 || n = 18813 || n = 19062 || n = 19067 || n = 19070 || n = 19319 || n = 19324 || n = 19327)
+	; 12 bytes
+	delay_n (n-2)
+	nop
+.elseif(n = 18806)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #73
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 18807)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #73
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 18808)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #73
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 18809 || n = 18814 || n = 19066 || n = 19071 || n = 19323 || n = 19328)
+	; 12 bytes
+	pha
+	delay_n (n-3)
+.elseif(n = 18811)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #73
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 18812)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #73
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 19060)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #74
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 19063)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #74
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 19064)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #74
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 19065)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #74
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 19068)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #74
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 19069)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #74
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 19317)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #75
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 19320)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #75
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 19321)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #75
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 19322)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #75
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 19325)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #75
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 19326)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #75
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.endif
+.else
+; 19376 to 20000
+.if((n > 19375 && n < 19574) || n = 19575 || (n > 19585 && n < 19831) || n = 19832 || (n > 19842 && n < 20001))
+	; 13 bytes
+	pha
+	txa
+	pha
+	ldx #>(n-52)
+	lda #<(n-52)
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 19574)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #76
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 19576 || n = 19581 || n = 19584 || n = 19833 || n = 19838 || n = 19841)
+	; 12 bytes
+	delay_n (n-2)
+	nop
+.elseif(n = 19577)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #76
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 19578)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #76
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 19579)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #76
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 19580 || n = 19585 || n = 19837 || n = 19842)
+	; 12 bytes
+	pha
+	delay_n (n-3)
+.elseif(n = 19582)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #76
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 19583)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #76
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.elseif(n = 19831)
+	; 11 bytes
+	tay
+	stx @zptemp
+	lax #77
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 19834)
+	; 11 bytes
+	pha
+	stx @zptemp
+	lax #77
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	pla
+.elseif(n = 19835)
+	; 12 bytes
+	tay
+	stx @zptemp
+	pla
+	lax #77
+	jsr delay_256x_a_30_clocks
+	ldx @zptemp
+	tya
+.elseif(n = 19836)
+	; 11 bytes
+	pha
+	txa
+	tay
+	lax #77
+	jsr delay_256x_a_30_clocks
+	tya
+	tax
+	pla
+.elseif(n = 19839)
+	; 11 bytes
+	pha
+	txa
+	pha
+	lax #77
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	pla
+.elseif(n = 19840)
+	; 12 bytes
+	tay
+	pla
+	txa
+	pha
+	lax #77
+	jsr delay_256x_a_30_clocks
+	pla
+	tax
+	tya
+.endif
+.endif
+.endif
+.endif
+.endif
+.endif
+
+.endif
+	rest
+.endmacro

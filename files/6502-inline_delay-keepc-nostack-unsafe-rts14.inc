@@ -1,0 +1,1 @@
+6502-inline_delay-keepc-nostack-unsafe.inc
